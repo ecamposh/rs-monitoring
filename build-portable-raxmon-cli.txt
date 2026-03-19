@@ -1,0 +1,222 @@
+# Instructions
+# Copy docker script to a build-portable-raxmon-cli.sh file
+# chmod +x build-portable-raxmon-cli.sh
+# Execute bash script ./build-portable-raxmon-cli.sh
+# tar -xzvf rackspace-monitoring-cli-portable-ubuntu1604.tar.gz
+# Create file ~/.raxrc
+# Add the following
+[credentials]
+username=<rackspace_username>
+api_key=<rackspace_api_key>
+[api]
+url=https://monitoring.api.rackspacecloud.com/v1.0
+[auth_api]
+url=https://identity.api.rackspacecloud.com/v2.0/tokens
+[ssl]
+verify=true
+# ./raxmon-agent-tokens-list
+# ./raxmon-entities-list
+
+docker run --rm -v "$(pwd):/out" ubuntu:16.04 bash -c '
+set -euo pipefail
+
+export DEBIAN_FRONTEND=noninteractive
+
+echo "[1/8] Installing packages..."
+apt-get update
+apt-get install -y \
+    python \
+    python-dev \
+    python-pip \
+    build-essential \
+    ca-certificates \
+    curl \
+    binutils \
+    file
+
+echo "[2/8] Updating pip tooling..."
+python -m pip install --upgrade \
+    "pip<21" \
+    "setuptools<45" \
+    "wheel<0.35"
+
+echo "[3/8] Installing rackspace-monitoring-cli + pinned libcloud..."
+python -m pip install --no-cache-dir "apache-libcloud==2.0.0"
+python -m pip install --no-cache-dir "rackspace-monitoring-cli"
+
+echo "[4/8] Creating portable layout..."
+mkdir -p /portable/bin
+mkdir -p /portable/lib
+mkdir -p /portable/lib-extra
+mkdir -p /portable/lib/python2.7/site-packages
+mkdir -p /portable/lib/python2.7/dist-packages
+
+cp -a /usr/bin/python2.7 /portable/bin/
+cp -a /usr/lib/python2.7/. /portable/lib/python2.7/
+
+cp -a /usr/local/lib/python2.7/dist-packages/. /portable/lib/python2.7/dist-packages/ 2>/dev/null || true
+cp -a /usr/local/lib/python2.7/site-packages/. /portable/lib/python2.7/site-packages/ 2>/dev/null || true
+
+echo "[4b/8] Copying raxmon launcher(s)..."
+RAXMON_BIN="$(command -v raxmon || true)"
+if [ -n "$RAXMON_BIN" ]; then
+    cp -a "$RAXMON_BIN" /portable/bin/
+fi
+
+RAXMON_CMDS="$(find /usr/local/bin /usr/bin -maxdepth 1 -type f -name "raxmon-*" | sort || true)"
+if [ -z "$RAXMON_CMDS" ]; then
+    echo "ERROR: no raxmon-* commands found"
+    exit 1
+fi
+
+echo "$RAXMON_CMDS" | while read -r cmd; do
+    [ -n "$cmd" ] && cp -a "$cmd" /portable/bin/
+done
+
+echo "Bundled commands:"
+echo "$RAXMON_CMDS" | sed "s#^.*/##"
+
+echo "[5/8] Copying native shared libraries for python..."
+ldd /usr/bin/python2.7 | awk "/=>/ {print \$3}" | while read -r lib; do
+    case "$lib" in
+        "" ) ;;
+        */libc.so.*|*/libpthread.so.*|*/ld-linux-*.so.*|*/libm.so.*|*/librt.so.*|*/libdl.so.*|*/libutil.so.*|*/libgcc_s.so.*)
+            echo "Skipping glibc core: $lib"
+            ;;
+        *)
+            [ -f "$lib" ] && cp -n "$lib" /portable/lib-extra/
+            ;;
+    esac
+done
+
+echo "[5b/8] Copying native shared libraries for extension modules..."
+find /portable/lib/python2.7 \( -path "*/site-packages/*" -o -path "*/dist-packages/*" -o -path "*/lib-dynload/*" \) -name "*.so" | while read -r sofile; do
+    ldd "$sofile" 2>/dev/null | awk "/=>/ {print \$3}" | while read -r lib; do
+        case "$lib" in
+            "" ) ;;
+            */libc.so.*|*/libpthread.so.*|*/ld-linux-*.so.*|*/libm.so.*|*/librt.so.*|*/libdl.so.*|*/libutil.so.*|*/libgcc_s.so.*)
+                ;;
+            *)
+                [ -f "$lib" ] && cp -n "$lib" /portable/lib-extra/
+                ;;
+        esac
+    done
+done
+
+echo "[6/8] Cleaning up..."
+find /portable -type d -name "__pycache__" -exec rm -rf {} + || true
+find /portable -type f \( -name "*.pyc" -o -name "*.pyo" \) -delete || true
+
+strip /portable/bin/python2.7 || true
+
+find /portable/bin -maxdepth 1 -type f | while read -r f; do
+    if file "$f" | grep -q "ELF"; then
+        strip "$f" || true
+    fi
+done
+
+find /portable/lib -type f -name "*.so" -exec strip {} \; 2>/dev/null || true
+
+find /portable/lib-extra -type f | while read -r f; do
+    if file "$f" | grep -q "ELF"; then
+        strip "$f" || true
+    fi
+done
+
+echo "[7/8] Writing runtime bootstrap..."
+cat > /portable/.raxmon-bootstrap.py <<EOF
+# -*- coding: utf-8 -*-
+from __future__ import absolute_import
+import os
+import runpy
+import sys
+
+def apply_patches():
+    try:
+        import libcloud.security
+        libcloud.security.VERIFY_SSL_CERT = False
+
+        try:
+            if hasattr(libcloud.security, "CA_CERTS_PATH"):
+                libcloud.security.CA_CERTS_PATH[:] = []
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+    try:
+        import requests
+        from requests.packages.urllib3.exceptions import InsecureRequestWarning
+        requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+    except Exception:
+        pass
+
+def main():
+    apply_patches()
+
+    if len(sys.argv) < 2:
+        sys.stderr.write("Usage: bootstrap <script> [args...]\n")
+        sys.exit(1)
+
+    script = sys.argv[1]
+    sys.argv = sys.argv[1:]
+    runpy.run_path(script, run_name="__main__")
+
+if __name__ == "__main__":
+    main()
+EOF
+
+cat > /portable/.run-python2 <<EOF
+#!/bin/bash
+set -e
+SELF="\$1"
+shift
+DIR="\$(cd "\$(dirname "\$SELF")" && pwd)"
+CMD_BASENAME="\$(basename "\$SELF")"
+
+export PYTHONHOME="\$DIR"
+export PYTHONPATH="\$DIR/lib/python2.7:\$DIR/lib/python2.7/lib-dynload:\$DIR/lib/python2.7/dist-packages:\$DIR/lib/python2.7/site-packages"
+export LD_LIBRARY_PATH="\$DIR/lib-extra:\${LD_LIBRARY_PATH:-}"
+
+exec "\$DIR/bin/python2.7" "\$DIR/.raxmon-bootstrap.py" "\$DIR/bin/\$CMD_BASENAME" "\$@"
+EOF
+chmod +x /portable/.run-python2
+
+echo "[7b/8] Creating top-level launchers..."
+find /portable/bin -maxdepth 1 -type f -name "raxmon-*" | while read -r cmd; do
+    base="$(basename "$cmd")"
+    cat > "/portable/$base" <<EOF
+#!/bin/bash
+set -e
+DIR="\$(cd "\$(dirname "\${BASH_SOURCE[0]}")" && pwd)"
+exec "\$DIR/.run-python2" "\$DIR/$base" "\$@"
+EOF
+    chmod +x "/portable/$base"
+done
+
+if [ -f /portable/bin/raxmon ]; then
+    cat > /portable/raxmon <<EOF
+#!/bin/bash
+set -e
+DIR="\$(cd "\$(dirname "\${BASH_SOURCE[0]}")" && pwd)"
+export PYTHONHOME="\$DIR"
+export PYTHONPATH="\$DIR/lib/python2.7:\$DIR/lib/python2.7/lib-dynload:\$DIR/lib/python2.7/dist-packages:\$DIR/lib/python2.7/site-packages"
+export LD_LIBRARY_PATH="\$DIR/lib-extra:\${LD_LIBRARY_PATH:-}"
+exec "\$DIR/bin/python2.7" "\$DIR/.raxmon-bootstrap.py" "\$DIR/bin/raxmon" "\$@"
+EOF
+    chmod +x /portable/raxmon
+fi
+
+cat > /portable/list-raxmon-commands <<EOF
+#!/bin/bash
+set -e
+DIR="\$(cd "\$(dirname "\${BASH_SOURCE[0]}")" && pwd)"
+find "\$DIR" -maxdepth 1 -type f -name "raxmon-*" -printf "%f\n" | sort
+EOF
+chmod +x /portable/list-raxmon-commands
+
+echo "[8/8] Creating tarball..."
+cd /portable
+tar czf /out/rackspace-monitoring-cli-portable-ubuntu1604.tar.gz .
+echo "SUCCESS: /out/rackspace-monitoring-cli-portable-ubuntu1604.tar.gz created"
+'
